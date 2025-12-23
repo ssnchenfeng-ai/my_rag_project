@@ -1,0 +1,24 @@
+# 1. 隐藏的敏感配置文件 (绝对不能上传)
+.env
+
+# 2. Python 虚拟环境 (体积巨大，让用户自己建立)
+.venv/
+env/
+venv/
+ENV/
+
+# 3. 数据库数据 (数据库通常很大且包含私有数据，建议让用户自己同步生成)
+chroma_db/
+
+# 4. Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 5. 操作系统产生的杂物文件
+.DS_Store
+Thumbs.db
+
+# 6. 编辑器配置
+.vscode/
+.idea/

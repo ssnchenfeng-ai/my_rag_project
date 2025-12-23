@@ -1,0 +1,389 @@
+import streamlit as st
+import sys
+from dotenv import load_dotenv
+import os
+import re
+import json
+import ollama
+import chromadb
+import frontmatter
+from neo4j import GraphDatabase
+
+# ================= 0. 加载环境变量 =================
+load_dotenv()  # 这行代码会自动读取项目根目录下的 .env 文件
+
+# ================= 1. 从环境变量获取配置 =================
+# 使用 os.getenv('变量名', '默认值') 的方式读取
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")  # 密码不建议设默认值
+
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "chemical_kb")
+
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text:latest")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-r1:latest")
+
+# 获取本地数据路径
+DEFAULT_DATA_PATH = os.getenv("DATA_PATH", "./data/")
+
+# ================= 2. 初始化连接 =================
+neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+# ================= 3. 核心功能函数 =================
+
+def extract_tags(text):
+    pattern = r'[A-Z]{1,3}-\d{2,4}[A-Z]?'
+    return list(set(re.findall(pattern, text)))
+
+def clean_markdown(content):
+    content = re.sub(r'^\\---', '---', content, flags=re.MULTILINE)
+    content = re.sub(r'^\\(#+)', r'\1', content, flags=re.MULTILINE)
+    content = re.sub(r'[\u200B-\u200D\uFEFF]', '', content)
+    lines = content.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if re.match(r'^\|[\s*:|-]+\|$', line.strip()): continue 
+        if line.strip().startswith('|'):
+            line = line.strip('|').replace('|', '   ')
+        cleaned_lines.append(line)
+    return '\n'.join(cleaned_lines)
+
+def hierarchical_chunking(content, file_path):
+    file_name = os.path.basename(file_path).replace('.md', '')
+    post = frontmatter.loads(content)
+    doc_metadata = post.metadata
+    main_content = post.content
+    doc_title = doc_metadata.get('title', file_name)
+    final_chunks = []
+    h3_blocks = re.split(r'(?=^###\s+)', main_content, flags=re.MULTILINE)
+    for i, h3_block in enumerate(h3_blocks):
+        h3_block = h3_block.strip()
+        if not h3_block: continue
+        h3_match = re.search(r'^###\s+(.*)$', h3_block, flags=re.MULTILINE)
+        h3_title = h3_match.group(1).strip() if h3_match else "概览"
+        h3_content = re.sub(r'^###\s+.*$', '', h3_block, flags=re.MULTILINE).strip()
+        if '#### ' in h3_content:
+            h4_blocks = re.split(r'(?=^####\s+)', h3_content, flags=re.MULTILINE)
+            for j, h4_block in enumerate(h4_blocks):
+                h4_block = h4_block.strip()
+                if len(h4_block) < 20: continue
+                h4_match = re.search(r'^####\s+(.*)$', h4_block, flags=re.MULTILINE)
+                h4_title = h4_match.group(1).strip() if h4_match else ""
+                content_body = re.sub(r'^####\s+.*$', '', h4_block, flags=re.MULTILINE).strip()
+                breadcrumb = f"{doc_title} > {h3_title}" + (f" > {h4_title}" if h4_title else "")
+                final_chunks.append({
+                    "id": f"{file_name}-{i}-{j}",
+                    "text": f"【语境：{breadcrumb}】\n{content_body}",
+                    "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
+                })
+        else:
+            if len(h3_content) > 20:
+                breadcrumb = f"{doc_title} > {h3_title}"
+                final_chunks.append({
+                    "id": f"{file_name}-{i}",
+                    "text": f"【语境：{breadcrumb}】\n{h3_content}",
+                    "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
+                })
+    return final_chunks
+
+def analyze_intent_with_llm(prompt, extracted_tags):
+    # 将模型提示词也改为中文，有助于模型更准确地按中文逻辑思考
+    system_prompt = f"""你是一个工业意图分析助手。请分析用户问题的意图并返回 JSON。
+    可选意图：
+    - Path_Analysis: 询问物料流向、路径、经过哪里。
+    - Fault_Diagnosis: 询问故障原因、上游溯源。
+    - Status_Check: 询问设备设计参数、监控仪表。
+    - Procedure_Query: 询问操作步骤、熟化流程。
+    - Info_Query: 询问基本定义或通用信息。
+
+    用户已提取位号：{extracted_tags}
+    返回格式：{{"intent": "意图名称", "start_node": "起点位号", "end_node": "终点位号", "target_name": "设备名称"}}"""
+    try:
+        # 这里建议统一使用一个能聊天的模型
+        response = ollama.chat(model=LLM_MODEL, messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': prompt}
+        ], format='json')
+        return json.loads(response['message']['content'])
+    except:
+        return {"intent": "Info_Query"}
+
+def build_cypher(llm_result, extracted_tags, user_text):
+    intent = llm_result.get("intent", "Info_Query")
+    tags = extracted_tags
+    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往"]):
+        intent = "Path_Analysis"
+    cypher = ""; params = {}
+    if intent == "Path_Analysis":
+        start = llm_result.get("start_node") or (tags[0] if tags else None)
+        end = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
+        if start and end:
+            cypher = """
+            MATCH (start:Asset), (end:Asset)
+            WHERE (start.tag = $startTag OR start.name CONTAINS $startTag)
+              AND (end.tag = $endTag OR end.name CONTAINS $endTag)
+              AND NOT start:Pipeline AND NOT end:Pipeline AND start <> end
+            MATCH path = shortestPath((start)-[:FEEDS|FLOWS_THROUGH|MERGES_INTO|BRANCHES_TO*..30]-(end))
+            RETURN 'Path_Analysis' as intent, [n in nodes(path) | n.tag] as path_tags, 
+                   [n in nodes(path) | n.name] as path_names, [r in relationships(path) | type(r)] as relationships,
+                   length(path) as steps
+            """
+            params = {"startTag": start, "endTag": end}
+    if not cypher and tags:
+        params = {"tags": tags}
+        match_clause = "UNWIND $tags AS qTag MATCH (target:Asset) WHERE target.tag = qTag OR target.tag STARTS WITH qTag"
+        if intent == "Fault_Diagnosis":
+            query = f"{match_clause} OPTIONAL MATCH upstreamPath = (target)<-[:FEEDS|FLOWS_THROUGH*1..5]-(source) RETURN target.tag as tag, 'Fault_Diagnosis' as intent, collect(DISTINCT source.tag) as upstream_trace"
+        elif intent == "Status_Check":
+            query = f"{match_clause} OPTIONAL MATCH (target)<-[:MONITORS]-(sensor:Instrument) RETURN target.tag as tag, target.design_temp as temp, target.design_press as press, collect(DISTINCT sensor.tag) as monitors"
+        elif intent == "Procedure_Query":
+            query = f"{match_clause} OPTIONAL MATCH (target)<-[:ACTS_ON]-(step:OperationStep) RETURN target.tag as tag, collect(DISTINCT step.description) as steps"
+        else:
+            query = f"{match_clause} RETURN target.tag as tag, target.name as name, target.description as desc, 'Info_Query' as intent"
+        cypher = query
+    return cypher, params
+
+def query_neo4j(query, params):
+    if not query: return []
+    # 终端调试信息保留英文，方便排查
+    print(f"\n[调试] 执行 Cypher: {query}\n[调试] 参数: {params}", file=sys.stderr, flush=True)
+    try:
+        with neo4j_driver.session() as session:
+            result = session.run(query, **params)
+            return [dict(record) for record in result]
+    except Exception as e:
+        print(f"[错误] Neo4j 查询失败: {e}", file=sys.stderr, flush=True)
+        return []
+
+# ================= 4. Streamlit 界面显示 (中文中文化) =================
+st.set_page_config(page_title="化工知识图谱", layout="wide", page_icon="🧪")
+st.title("🧪 化工装置图谱 + 文档向量混合知识库")
+
+# --- 侧边栏：管理面板 ---
+with st.sidebar:
+    st.header("🛠️ 系统后台管理")
+    
+    # 显示向量库统计
+    try:
+        db_count = collection.count()
+        st.metric("已存储知识切片数", db_count)
+    except:
+        st.error("向量数据库连接失败")
+    
+    st.markdown("---")
+    
+    # 知识同步功能
+    st.subheader("📁 数据同步")
+    path_input = st.text_area("Markdown 文档路径", "/Users/chenfeng/培训资料/化工苯酐基本知识/")
+    
+    if st.button("🚀 开始增量同步"):
+        all_chunks = []
+        with st.spinner("正在扫描并解析文档..."):
+            if os.path.exists(path_input):
+                for root, _, files in os.walk(path_input):
+                    for file in files:
+                        if file.endswith('.md'):
+                            try:
+                                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                                    cleaned = clean_markdown(f.read())
+                                    chunks = hierarchical_chunking(cleaned, os.path.join(root, file))
+                                    all_chunks.extend(chunks)
+                            except: pass
+            
+        if all_chunks:
+            total = len(all_chunks)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, chunk in enumerate(all_chunks):
+                status_text.text(f"正在向量化 ({idx+1}/{total}): {chunk['id']}")
+                try:
+                    emb = ollama.embeddings(model=EMBED_MODEL, prompt=chunk['text'][:2000])['embedding']
+                    collection.upsert(
+                        ids=[chunk['id']], 
+                        embeddings=[emb], 
+                        documents=[chunk['text']], 
+                        metadatas=[{k:str(v) for k,v in chunk['metadata'].items()}]
+                    )
+                except: pass
+                progress_bar.progress((idx + 1) / total)
+            
+            status_text.text("✅ 同步圆满完成！")
+            st.balloons()
+            st.rerun()
+        else:
+            st.warning("未在该路径下找到有效文档")
+
+    if st.button("🗑️ 危险操作：清空向量库"):
+        chroma_client.delete_collection(COLLECTION_NAME)
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        st.warning("库已清空")
+        st.rerun()
+
+# --- 对话区域 ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 显示对话历史
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# 用户输入
+# --- 对话区域 (优化版) ---
+if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是什么？"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        # 1. 检索阶段 (ChromaDB + Neo4j)
+        graph_data = []
+        vector_docs = []
+        
+        with st.status("🔍 正在检索双库事实...", expanded=True) as status:
+            extracted_tags = extract_tags(prompt)
+            st.write(f"🏷️ **识别位号**: `{', '.join(extracted_tags) if extracted_tags else '未识别'}`")
+            
+            intent_res = analyze_intent_with_llm(prompt, extracted_tags)
+            st.write(f"🎯 **解析意图**: `{intent_res.get('intent', 'Info_Query')}`")
+            
+            cypher, params = build_cypher(intent_res, extracted_tags, prompt)
+            if cypher:
+                graph_data = query_neo4j(cypher, params)
+                st.write(f"📊 **图谱事实**: 已检索到关联拓扑")
+            
+            q_emb = ollama.embeddings(model=EMBED_MODEL, prompt=prompt)['embedding']
+            vector_res = collection.query(query_embeddings=[q_emb], n_results=3)
+            vector_docs = vector_res['documents'][0]
+            st.write(f"📄 **文档知识**: 已匹配相关描述片段")
+            
+            status.update(label=f"✅ 检索完成: 命中 {len(graph_data)} 条事实, {len(vector_docs)} 段文档", state="complete", expanded=False)
+
+        # 2. 回答生成阶段
+        full_response = ""
+        
+        # --- 【动态图标方案】创建一个化学/AI 动态占位符 ---
+        thinking_container = st.empty()
+        
+        with thinking_container.container():
+            st.markdown(
+                """
+                <style>
+                @keyframes pulse-ring {
+                  0% { transform: scale(.33); }
+                  80%, 100% { opacity: 0; }
+                }
+                @keyframes pulse-dot {
+                  0% { transform: scale(.8); }
+                  50% { transform: scale(1); }
+                  100% { transform: scale(.8); }
+                }
+                .ai-thinking-container {
+                  display: flex;
+                  flex-direction: column;
+                  align-items: center;
+                  justify-content: center;
+                  padding: 20px;
+                }
+                .pulse-wrapper {
+                  position: relative;
+                  width: 60px;
+                  height: 60px;
+                }
+                .pulse-dot {
+                  position: absolute;
+                  top: 15px; left: 15px;
+                  width: 30px; height: 30px;
+                  background-color: #007bff;
+                  border-radius: 50%;
+                  animation: pulse-dot 1.25s cubic-bezier(0.455, 0.03, 0.515, 0.955) -.4s infinite;
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  z-index: 2;
+                }
+                .pulse-ring {
+                  position: absolute;
+                  top: 0; left: 0;
+                  width: 60px; height: 60px;
+                  background-color: #007bff;
+                  border-radius: 50%;
+                  animation: pulse-ring 1.25s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+                  z-index: 1;
+                }
+                .thinking-text {
+                  margin-top: 15px;
+                  font-family: sans-serif;
+                  color: #007bff;
+                  font-weight: bold;
+                  letter-spacing: 1px;
+                }
+                </style>
+                
+                <div class="ai-thinking-container">
+                    <div class="pulse-wrapper">
+                        <div class="pulse-ring"></div>
+                        <div class="pulse-dot">
+                            <span style="font-size: 18px;">🧪</span>
+                        </div>
+                    </div>
+                    <div class="thinking-text">努力分析中...</div>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+
+
+        # 最终回答打字机显示的占位符
+        response_placeholder = st.empty()
+        
+        if not graph_data and not vector_docs:
+            thinking_container.empty() # 没找到数据，直接清除提示
+            response_placeholder.warning("⚠️ 根据目前知识库记录，未找到与该提问相关的位号事实或文档说明。")
+        else:
+            # 构造上下文和 Prompt
+            h_context = f"【图谱事实】: {json.dumps(graph_data, ensure_ascii=False)}\n\n【文档资料】: {' '.join(vector_docs)}"
+            
+            # --- 提示词微调 (确保模型不会太啰嗦) ---
+            sys_prompt = f"""你是一个专业的化工装置专家。请基于资料回答问题，严禁胡编乱造。如果资料不足，请直说不知道。"""
+
+            try:
+                # 调用模型
+                stream = ollama.chat(model=LLM_MODEL, messages=[
+                    {'role': 'system', 'content': sys_prompt},
+                    {'role': 'user', 'content': f"事实背景: {h_context}\n问题: {prompt}"}
+                ], stream=True)
+
+                # --- 核心改进：精确控制清除时机 ---
+                for chunk in stream:
+                    content = chunk['message']['content']
+                    
+                    # 只有当模型真正输出了内容（且非空）时，才清除“思考中”提示
+                    if content.strip() and not full_response:
+                        thinking_container.empty()
+                    
+                    full_response += content
+                    # 动态展示打字机效果
+                    response_placeholder.markdown(full_response + "▌")
+                
+                # 完成输出，移除光标
+                response_placeholder.markdown(full_response)
+                
+            except Exception as e:
+                thinking_container.empty()
+                st.error(f"❌ 模型生成失败: {e}")
+
+        # 3. 证据溯源显示 (保持不变)
+        if graph_data or vector_docs:
+            with st.expander("🔍 原始检索证据"):
+                tab1, tab2 = st.tabs(["图谱事实", "文档片段"])
+                with tab1: st.json(graph_data)
+                with tab2:
+                    for d in vector_docs: st.info(d)
+
+    # 将助手的回答存入对话历史
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
