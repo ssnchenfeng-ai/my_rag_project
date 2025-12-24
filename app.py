@@ -33,6 +33,27 @@ chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
 # ================= 3. 核心功能函数 =================
+# --- 在这里插入【递归拆分辅助函数】 ---
+def recursive_split_text(text, max_chars=1200, overlap=200):
+    """当段落过长时，按优先级进行递归拆分"""
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + max_chars
+        chunk = text[start:end]
+        if end < len(text):
+            # 寻找最后一个换行或句号，避免生硬切断
+            last_break = max(chunk.rfind('\n'), chunk.rfind('。'), chunk.rfind('. '))
+            if last_break > max_chars * 0.5: 
+                end = start + last_break + 1
+                chunk = text[start:end]
+        chunks.append(chunk)
+        start += (len(chunk) - overlap)
+        if len(chunk) <= overlap: break
+    return chunks
 
 def extract_tags(text):
     pattern = r'[A-Z]{1,3}-\d{2,4}[A-Z]?'
@@ -58,35 +79,51 @@ def hierarchical_chunking(content, file_path):
     main_content = post.content
     doc_title = doc_metadata.get('title', file_name)
     final_chunks = []
+    
+    # 设定参数
+    MAX_CHUNK_LEN = 1200 
+    OVERLAP_LEN = 200
+
     h3_blocks = re.split(r'(?=^###\s+)', main_content, flags=re.MULTILINE)
     for i, h3_block in enumerate(h3_blocks):
         h3_block = h3_block.strip()
         if not h3_block: continue
+        
         h3_match = re.search(r'^###\s+(.*)$', h3_block, flags=re.MULTILINE)
         h3_title = h3_match.group(1).strip() if h3_match else "概览"
         h3_content = re.sub(r'^###\s+.*$', '', h3_block, flags=re.MULTILINE).strip()
+        
         if '#### ' in h3_content:
             h4_blocks = re.split(r'(?=^####\s+)', h3_content, flags=re.MULTILINE)
             for j, h4_block in enumerate(h4_blocks):
                 h4_block = h4_block.strip()
                 if len(h4_block) < 20: continue
+                
                 h4_match = re.search(r'^####\s+(.*)$', h4_block, flags=re.MULTILINE)
                 h4_title = h4_match.group(1).strip() if h4_match else ""
                 content_body = re.sub(r'^####\s+.*$', '', h4_block, flags=re.MULTILINE).strip()
+                
                 breadcrumb = f"{doc_title} > {h3_title}" + (f" > {h4_title}" if h4_title else "")
-                final_chunks.append({
-                    "id": f"{file_name}-{i}-{j}",
-                    "text": f"【语境：{breadcrumb}】\n{content_body}",
-                    "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
-                })
+                
+                # --- 调用递归拆分 ---
+                sub_parts = recursive_split_text(content_body, MAX_CHUNK_LEN, OVERLAP_LEN)
+                for k, part in enumerate(sub_parts):
+                    final_chunks.append({
+                        "id": f"{file_name}-{i}-{j}-p{k}",
+                        "text": f"【语境：{breadcrumb}】\n{part}",
+                        "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
+                    })
         else:
             if len(h3_content) > 20:
                 breadcrumb = f"{doc_title} > {h3_title}"
-                final_chunks.append({
-                    "id": f"{file_name}-{i}",
-                    "text": f"【语境：{breadcrumb}】\n{h3_content}",
-                    "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
-                })
+                # --- 调用递归拆分 ---
+                sub_parts = recursive_split_text(h3_content, MAX_CHUNK_LEN, OVERLAP_LEN)
+                for k, part in enumerate(sub_parts):
+                    final_chunks.append({
+                        "id": f"{file_name}-{i}-p{k}",
+                        "text": f"【语境：{breadcrumb}】\n{part}",
+                        "metadata": {**doc_metadata, "breadcrumb": breadcrumb, "source": file_path}
+                    })
     return final_chunks
 
 def analyze_intent_with_llm(prompt, extracted_tags):
