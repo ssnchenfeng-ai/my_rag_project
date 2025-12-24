@@ -56,8 +56,25 @@ def recursive_split_text(text, max_chars=1200, overlap=200):
     return chunks
 
 def extract_tags(text):
-    pattern = r'[A-Z]{1,3}-\d{2,4}[A-Z]?'
-    return list(set(re.findall(pattern, text)))
+    # 1. 匹配模式：
+    # ([a-zA-Z]{1,3})  -> 捕获1-3位字母前缀（不区分大小写）
+    # [-_]?            -> 匹配可选的连字符或下划线
+    # (\d{2,4})        -> 捕获2-4位数字
+    # ([a-zA-Z]?)      -> 捕获可选的一位字母后缀
+    pattern = r'([a-zA-Z]{1,3})[\s\-_]?(\d{2,4})([a-zA-Z]?)'
+    # 找到所有符合条件的组合
+    matches = re.findall(pattern, text)
+    
+    normalized_tags = []
+    for prefix, digits, suffix in matches:
+        # 2. 标准化处理：
+        # 全部转为大写，并在字母与数字之间强制加上 "-"
+        # 例子：d43 -> D-43, D_43 -> D-43, d-43a -> D-43A
+        standard_tag = f"{prefix.upper()}-{digits}{suffix.upper()}"
+        normalized_tags.append(standard_tag)
+    
+    # 返回去重后的结果
+    return list(set(normalized_tags))
 
 def clean_markdown(content):
     content = re.sub(r'^\\---', '---', content, flags=re.MULTILINE)
@@ -151,36 +168,64 @@ def analyze_intent_with_llm(prompt, extracted_tags):
 def build_cypher(llm_result, extracted_tags, user_text):
     intent = llm_result.get("intent", "Info_Query")
     tags = extracted_tags
-    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往"]):
+    
+    # 路径分析意图识别增强
+    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往", "联系"]):
         intent = "Path_Analysis"
-    cypher = ""; params = {}
+        
+    cypher = ""
+    params = {}
+    
     if intent == "Path_Analysis":
-        start = llm_result.get("start_node") or (tags[0] if tags else None)
-        end = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
-        if start and end:
+        # 获取起点和终点
+        start_tag = llm_result.get("start_node") or (tags[0] if tags else None)
+        end_tag = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
+        
+        if start_tag and end_tag:
+            # 1. 使用新的关系类型 PIPE
+            # 2. 属性名改为 .Tag
+            # 3. 在返回列表中使用 [n in nodes(path) WHERE n.Tag <> 'TEE' | n.Tag] 过滤掉三通
             cypher = """
-            MATCH (start:Asset), (end:Asset)
-            WHERE (start.tag = $startTag OR start.name CONTAINS $startTag)
-              AND (end.tag = $endTag OR end.name CONTAINS $endTag)
-              AND NOT start:Pipeline AND NOT end:Pipeline AND start <> end
-            MATCH path = shortestPath((start)-[:FEEDS|FLOWS_THROUGH|MERGES_INTO|BRANCHES_TO*..30]-(end))
-            RETURN 'Path_Analysis' as intent, [n in nodes(path) | n.tag] as path_tags, 
-                   [n in nodes(path) | n.name] as path_names, [r in relationships(path) | type(r)] as relationships,
-                   length(path) as steps
+             MATCH (start:Asset), (end:Asset)
+             WHERE (start.Tag STARTS WITH $startTag OR start.Tag = $startTagAlt)
+               AND (end.Tag STARTS WITH $endTag OR end.Tag = $endTagAlt)
+             MATCH path = shortestPath((start)-[:PIPE|MEASURES|CONTROLS*..30]-(end))
+             RETURN [n in nodes(path) WHERE n.Tag <> 'TEE' AND n.Tag IS NOT NULL | n.Tag] as path_tags
             """
-            params = {"startTag": start, "endTag": end}
+            params = {
+                "startTag": start_tag, 
+                "startTagAlt": start_tag.replace("-", ""),
+                "endTag": end_tag,
+                "endTagAlt": end_tag.replace("-", "")
+            }
+
     if not cypher and tags:
         params = {"tags": tags}
-        match_clause = "UNWIND $tags AS qTag MATCH (target:Asset) WHERE target.tag = qTag OR target.tag STARTS WITH qTag"
+        # 基础匹配逻辑更新为 .Tag
+        match_clause = "UNWIND $tags AS qTag MATCH (target:Asset) WHERE target.Tag = qTag OR target.Tag = replace(qTag, '-', '')"
+        
         if intent == "Fault_Diagnosis":
-            query = f"{match_clause} OPTIONAL MATCH upstreamPath = (target)<-[:FEEDS|FLOWS_THROUGH*1..5]-(source) RETURN target.tag as tag, 'Fault_Diagnosis' as intent, collect(DISTINCT source.tag) as upstream_trace"
+            # 追溯上游，使用 PIPE 关系
+            cypher = f"""
+            {match_clause}
+            OPTIONAL MATCH (target)<-[:PIPE*1..6]-(source)
+            WHERE source.Tag <> 'TEE'
+            RETURN target.Tag as tag, 'Fault_Diagnosis' as intent, collect(DISTINCT source.Tag) as upstream_trace
+            """
         elif intent == "Status_Check":
-            query = f"{match_clause} OPTIONAL MATCH (target)<-[:MONITORS]-(sensor:Instrument) RETURN target.tag as tag, target.design_temp as temp, target.design_press as press, collect(DISTINCT sensor.tag) as monitors"
-        elif intent == "Procedure_Query":
-            query = f"{match_clause} OPTIONAL MATCH (target)<-[:ACTS_ON]-(step:OperationStep) RETURN target.tag as tag, collect(DISTINCT step.description) as steps"
+            # 查看监控仪表，使用 MEASURES 关系
+            cypher = f"""
+            {match_clause}
+            OPTIONAL MATCH (target)-[:MEASURES]-(sensor:Instrument)
+            RETURN target.Tag as tag, target.desc as desc, collect(DISTINCT sensor.Tag) as monitors
+            """
         else:
-            query = f"{match_clause} RETURN target.tag as tag, target.name as name, target.description as desc, 'Info_Query' as intent"
-        cypher = query
+            # 基础信息查询
+            cypher = f"""
+            {match_clause}
+            RETURN target.Tag as tag, target.desc as desc, labels(target) as types, 'Info_Query' as intent
+            """
+            
     return cypher, params
 
 def query_neo4j(query, params):
@@ -291,7 +336,11 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
             cypher, params = build_cypher(intent_res, extracted_tags, prompt)
             if cypher:
                 graph_data = query_neo4j(cypher, params)
-                st.write(f"📊 **图谱事实**: 已检索到关联拓扑")
+                # --- 这里的逻辑改为条件显示 ---
+                if graph_data:
+                        st.write("✅ **图谱事实**: 已成功检索到关联拓扑")
+                else:
+                     st.write("⚠️ **图谱事实**: 未能在图数据库中找到匹配的路径或节点")
             
             q_emb = ollama.embeddings(model=EMBED_MODEL, prompt=prompt)['embedding']
             vector_res = collection.query(query_embeddings=[q_emb], n_results=3)
@@ -386,7 +435,16 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
             h_context = f"【图谱事实】: {json.dumps(graph_data, ensure_ascii=False)}\n\n【文档资料】: {' '.join(vector_docs)}"
             
             # --- 提示词微调 (确保模型不会太啰嗦) ---
-            sys_prompt = f"""你是一个专业的化工装置专家。请基于资料回答问题，严禁胡编乱造。如果资料不足，请直说不知道。"""
+            sys_prompt = f"""你是一个专业的化工装置专家。请结合【图谱事实】和【文档资料】回答用户的【问题】。如果【图谱事实】和【知识库文档】中没有足够的信息，就直接说'根据我现有的知识，无法回答这个问题'，不要编造答案。
+            
+             
+            ### 回答策略
+                        1. **综合判断**: 图谱提供了准确的设备位号和连接关系，知识库提供了详细的操作步骤和原理。
+                        2 . **故障诊断**: 如果图谱显示多条供料支路，请分别分析。结合知识库中的故障处理方法。
+                        3. **冲突处理**: 涉及设备连接关系时，以图谱为准；涉及操作细节时，以知识库为准。
+
+            
+            """
 
             try:
                 # 调用模型
