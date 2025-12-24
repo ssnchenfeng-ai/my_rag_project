@@ -169,63 +169,100 @@ def build_cypher(llm_result, extracted_tags, user_text):
     intent = llm_result.get("intent", "Info_Query")
     tags = extracted_tags
     
-    # 路径分析意图识别增强
-    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往", "联系"]):
+    # 强制修正：如果涉及两个位号且包含流程动词，设为路径分析
+    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往", "流程", "联系", "工艺"]):
         intent = "Path_Analysis"
         
-    cypher = ""
-    params = {}
-    
+    cypher = ""; params = {}
+
     if intent == "Path_Analysis":
-        # 获取起点和终点
-        start_tag = llm_result.get("start_node") or (tags[0] if tags else None)
-        end_tag = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
+        start = llm_result.get("start_node") or (tags[0] if tags else None)
+        end = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
         
-        if start_tag and end_tag:
-            # 1. 使用新的关系类型 PIPE
-            # 2. 属性名改为 .Tag
-            # 3. 在返回列表中使用 [n in nodes(path) WHERE n.Tag <> 'TEE' | n.Tag] 过滤掉三通
+        if start and end:
+            # 路径分析：返回极其详尽的节点和管道属性
             cypher = """
-             MATCH (start:Asset), (end:Asset)
-             WHERE (start.Tag STARTS WITH $startTag OR start.Tag = $startTagAlt)
-               AND (end.Tag STARTS WITH $endTag OR end.Tag = $endTagAlt)
-             MATCH path = shortestPath((start)-[:PIPE|MEASURES|CONTROLS*..30]-(end))
-             RETURN [n in nodes(path) WHERE n.Tag <> 'TEE' AND n.Tag IS NOT NULL | n.Tag] as path_tags
+            MATCH (start:Asset), (end:Asset)
+    WHERE (start.Tag STARTS WITH $startTag OR replace(start.Tag, '-', '') = $startTagAlt)
+      AND (end.Tag STARTS WITH $endTag OR replace(end.Tag, '-', '') = $endTagAlt)
+    
+    // 1. 寻找顺流方向的最短路径
+    MATCH path = shortestPath((start)-[:PIPE|MEASURES*..30]->(end))
+    
+    // 2. 格式化返回：保留所有物理语义并按工艺顺序交织
+    RETURN 
+        'Path_Analysis' as intent,
+        [i IN range(0, length(path)-1) | {
+            // 起点设备
+            from_equipment: CASE 
+                WHEN nodes(path)[i].Tag <> "TEE" AND nodes(path)[i].type <> "Instrument" AND nodes(path)[i].type <> "TappingPoint"
+                THEN {tag: nodes(path)[i].Tag, desc: nodes(path)[i].desc, type: nodes(path)[i].type}
+                ELSE "辅助连接点(TEE/测点)" 
+            END,
+            
+            // 管道语义（12项完整属性）
+            pipeline_semantics: {
+                fluid: relationships(path)[i].fluid,
+                dn: relationships(path)[i].dn,
+                material: relationships(path)[i].material,
+                insulation: relationships(path)[i].insulation,
+                pn: relationships(path)[i].pn,
+                fromPort: relationships(path)[i].fromPort,
+                toPort: relationships(path)[i].toPort,
+                fromDesc: relationships(path)[i].fromDesc,
+                toDesc: relationships(path)[i].toDesc,
+                fromRegion: relationships(path)[i].fromRegion,
+                toRegion: relationships(path)[i].toRegion,
+                tag: relationships(path)[i].tag
+            },
+            
+            // 终点设备
+            to_equipment: CASE 
+                WHEN nodes(path)[i+1].Tag <> "TEE" AND nodes(path)[i+1].type <> "Instrument" AND nodes(path)[i+1].type <> "TappingPoint"
+                THEN {tag: nodes(path)[i+1].Tag, desc: nodes(path)[i+1].desc, type: nodes(path)[i+1].type}
+                ELSE "辅助连接点(TEE/测点)" 
+            END
+        }] as structured_process_flow,
+        length(path) as total_hops
             """
             params = {
-                "startTag": start_tag, 
-                "startTagAlt": start_tag.replace("-", ""),
-                "endTag": end_tag,
-                "endTagAlt": end_tag.replace("-", "")
+                "startTag": start, "startTagAlt": start.replace("-", ""),
+                "endTag": end, "endTagAlt": end.replace("-", "")
             }
 
-    if not cypher and tags:
+    elif intent == "Fault_Diagnosis":
+        # 故障诊断：侧重于追溯上游设备及其描述
+        cypher = """
+        UNWIND $tags AS qTag
+        MATCH (target:Asset) WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
+        OPTIONAL MATCH (target)<-[:PIPE*1..5]-(source:Asset)
+        WHERE source.Tag <> 'TEE'
+        RETURN target.Tag as tag, 'Fault_Diagnosis' as intent, 
+               collect(DISTINCT {tag: source.Tag, desc: source.desc}) as upstream_trace
+        """
         params = {"tags": tags}
-        # 基础匹配逻辑更新为 .Tag
-        match_clause = "UNWIND $tags AS qTag MATCH (target:Asset) WHERE target.Tag = qTag OR target.Tag = replace(qTag, '-', '')"
-        
-        if intent == "Fault_Diagnosis":
-            # 追溯上游，使用 PIPE 关系
-            cypher = f"""
-            {match_clause}
-            OPTIONAL MATCH (target)<-[:PIPE*1..6]-(source)
-            WHERE source.Tag <> 'TEE'
-            RETURN target.Tag as tag, 'Fault_Diagnosis' as intent, collect(DISTINCT source.Tag) as upstream_trace
-            """
-        elif intent == "Status_Check":
-            # 查看监控仪表，使用 MEASURES 关系
-            cypher = f"""
-            {match_clause}
-            OPTIONAL MATCH (target)-[:MEASURES]-(sensor:Instrument)
-            RETURN target.Tag as tag, target.desc as desc, collect(DISTINCT sensor.Tag) as monitors
-            """
-        else:
-            # 基础信息查询
-            cypher = f"""
-            {match_clause}
-            RETURN target.Tag as tag, target.desc as desc, labels(target) as types, 'Info_Query' as intent
-            """
-            
+
+    elif intent == "Status_Check":
+        # 仪表检查：侧重于 MEASURES 关系和 Instrument 节点的参数
+        cypher = """
+        UNWIND $tags AS qTag
+        MATCH (target:Asset) WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
+        OPTIONAL MATCH (target)-[:MEASURES]-(sensor:Instrument)
+        RETURN target.Tag as tag, target.desc as desc, 
+               {temp: target.design_temp, press: target.design_press, spec: target.spec} as design_params,
+               collect(DISTINCT {tag: sensor.Tag, desc: sensor.desc, range: sensor.range, unit: sensor.unit}) as sensors
+        """
+        params = {"tags": tags}
+
+    else:
+        # 基础查询：返回位号、描述和类型
+        cypher = """
+        UNWIND $tags AS qTag
+        MATCH (target:Asset) WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
+        RETURN target.Tag as tag, target.desc as name, target.type as category, 'Info_Query' as intent
+        """
+        params = {"tags": tags}
+
     return cypher, params
 
 def query_neo4j(query, params):
@@ -439,7 +476,7 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
             
              
             ### 回答策略
-                        1. **综合判断**: 图谱提供了准确的设备位号和连接关系，知识库提供了详细的操作步骤和原理。
+                        1. **综合判断**: 图谱提供了准确的设备位号功能描述和连接关系的来源去向等，知识库提供了详细的操作步骤和原理。
                         2 . **故障诊断**: 如果图谱显示多条供料支路，请分别分析。结合知识库中的故障处理方法。
                         3. **冲突处理**: 涉及设备连接关系时，以图谱为准；涉及操作细节时，以知识库为准。
 
