@@ -75,6 +75,14 @@ def extract_tags(text):
     
     # 返回去重后的结果
     return list(set(normalized_tags))
+def is_noise_node(node_labels, node_tag):
+    """判断是否为需要忽略的辅助节点（如三通、跨页符、仪表）"""
+    ignore_labels = ['OffPageConnector', 'Instrument', 'Drawing']
+    ignore_tags = ['TEE', 'TappingPoint']
+    # 检查标签或位号是否包含忽略关键词
+    if any(l in node_labels for l in ignore_labels): return True
+    if any(t in str(node_tag).upper() for t in ignore_tags): return True
+    return False
 
 def clean_markdown(content):
     content = re.sub(r'^\\---', '---', content, flags=re.MULTILINE)
@@ -145,18 +153,19 @@ def hierarchical_chunking(content, file_path):
 
 def analyze_intent_with_llm(prompt, extracted_tags):
     # 将模型提示词也改为中文，有助于模型更准确地按中文逻辑思考
-    system_prompt = f"""你是一个工业意图分析助手。请分析用户问题的意图并返回 JSON。
-    可选意图：
-    - Path_Analysis: 询问物料流向、路径、经过哪里。
-    - Fault_Diagnosis: 询问故障原因、上游溯源。
-    - Status_Check: 询问设备设计参数、监控仪表。
-    - Procedure_Query: 询问操作步骤、熟化流程。
-    - Info_Query: 询问基本定义或通用信息。
+    system_prompt = f"""你是一个工业专家级意图分析助手。请分析用户问题的意图并返回 JSON。
+    
+    意图分类标准：
+    1. Path_Analysis: 询问工艺流程、物料流向、路径、经过哪些设备、跨页流程。
+    2. Fault_Diagnosis: 询问故障原因、上游溯源、串料分析、异常波动来源。
+    3. Status_Check: 询问设备设计参数（压力/温度/材质）、监控仪表位号、量程。
+    4. Procedure_Query: 询问操作步骤、启动/停止顺序、安全注意事项、SOP。
+    5. Info_Query: 询问基本定义、术语解释、通用常识。
 
-    用户已提取位号：{extracted_tags}
-    返回格式：{{"intent": "意图名称", "start_node": "起点位号", "end_node": "终点位号", "target_name": "设备名称"}}"""
+    用户提取位号：{extracted_tags}
+    返回格式：{{"intent": "意图名称", "start_node": "起点位号", "end_node": "终点位号", "target_tag": "目标位号"}}"""
+    
     try:
-        # 这里建议统一使用一个能聊天的模型
         response = ollama.chat(model=LLM_MODEL, messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': prompt}
@@ -169,172 +178,82 @@ def build_cypher(llm_result, extracted_tags, user_text):
     intent = llm_result.get("intent", "Info_Query")
     tags = extracted_tags
     
-    # 强制修正：如果涉及两个位号且包含流程动词，设为路径分析
-    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往", "流程", "联系", "工艺"]):
+    # 路径分析强制修正
+    if len(tags) >= 2 and any(k in user_text for k in ["到", "流", "经过", "去往", "流程"]):
         intent = "Path_Analysis"
         
     cypher = ""; params = {}
 
     if intent == "Path_Analysis":
+        # ... (保持之前优化的跨页路径代码) ...
         start = llm_result.get("start_node") or (tags[0] if tags else None)
         end = llm_result.get("end_node") or (tags[1] if len(tags)>1 else None)
-        
         if start and end:
-            # 路径分析：返回极其详尽的节点和管道属性
             cypher = """
             MATCH (start:Asset), (end:Asset)
-    WHERE (start.Tag STARTS WITH $startTag OR replace(start.Tag, '-', '') = $startTagAlt)
-      AND (end.Tag STARTS WITH $endTag OR replace(end.Tag, '-', '') = $endTagAlt)
-    
-    // 1. 寻找顺流方向的最短路径
-    MATCH path = shortestPath((start)-[:PIPE|MEASURES*..30]->(end))
-    
-    // 2. 格式化返回：保留所有物理语义并按工艺顺序交织
-    RETURN 
-        'Path_Analysis' as intent,
-        [i IN range(0, length(path)-1) | {
-            // 起点设备
-            from_equipment: CASE 
-                WHEN nodes(path)[i].Tag <> "TEE" AND nodes(path)[i].type <> "Instrument" AND nodes(path)[i].type <> "TappingPoint"
-                THEN {tag: nodes(path)[i].Tag, desc: nodes(path)[i].desc, type: nodes(path)[i].type}
-                ELSE "辅助连接点(TEE/测点)" 
-            END,
-            
-            // 管道语义（12项完整属性）
-            pipeline_semantics: {
-                fluid: relationships(path)[i].fluid,
-                dn: relationships(path)[i].dn,
-                material: relationships(path)[i].material,
-                insulation: relationships(path)[i].insulation,
-                pn: relationships(path)[i].pn,
-                fromPort: relationships(path)[i].fromPort,
-                toPort: relationships(path)[i].toPort,
-                fromDesc: relationships(path)[i].fromDesc,
-                toDesc: relationships(path)[i].toDesc,
-                fromRegion: relationships(path)[i].fromRegion,
-                toRegion: relationships(path)[i].toRegion,
-                tag: relationships(path)[i].tag
-            },
-            
-            // 终点设备
-            to_equipment: CASE 
-                WHEN nodes(path)[i+1].Tag <> "TEE" AND nodes(path)[i+1].type <> "Instrument" AND nodes(path)[i+1].type <> "TappingPoint"
-                THEN {tag: nodes(path)[i+1].Tag, desc: nodes(path)[i+1].desc, type: nodes(path)[i+1].type}
-                ELSE "辅助连接点(TEE/测点)" 
-            END
-        }] as structured_process_flow,
-        length(path) as total_hops
+            WHERE (start.Tag STARTS WITH $startTag OR replace(start.Tag, '-', '') = $startTagAlt)
+              AND (end.Tag STARTS WITH $endTag OR replace(end.Tag, '-', '') = $endTagAlt)
+            MATCH path = shortestPath((start)-[:PIPE|LINKS_TO*..60]->(end))
+            RETURN 'Path_Analysis' as intent,
+                   [n in nodes(path) | {tag: n.Tag, desc: n.desc, labels: labels(n)}] as nodes_data,
+                   [r in relationships(path) | properties(r)] as rels_data,
+                   length(path) as total_hops
             """
-            params = {
-                "startTag": start, "startTagAlt": start.replace("-", ""),
-                "endTag": end, "endTagAlt": end.replace("-", "")
-            }
+            params = {"startTag": start, "startTagAlt": start.replace("-", ""), "endTag": end, "endTagAlt": end.replace("-", "")}
 
-    elif intent == "Fault_Diagnosis":
-        # 故障诊断：侧重于追溯上游设备及其描述
+    elif intent == "Status_Check":
+        # 【新增】状态检查：查询设备属性 + 关联仪表
         cypher = """
         UNWIND $tags AS qTag
-        
-        // 1. 模糊匹配找到目标设备
-        MATCH (target:Asset) 
-        WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
-        
-        // 2. 查找上游路径 (使用 path 变量捕获完整拓扑)
-        // 这里查找 1 到 3 跳的上游设备，排除 TEE (三通) 这种无意义节点作为终点，但保留路径中的关系
-        MATCH path = (target)<-[:PIPE*1..3]-(source:Asset)
-        WHERE source.Tag <> 'TEE'
-        
-        // 3. 展开路径中的每一段关系 (Relationship)
-        UNWIND relationships(path) AS r
-        
-        // 4. 提取关系的起点(start)和终点(end)
-        // 注意：虽然我们是往上游查，但物理流向依然是 start -> end
-        WITH target, startNode(r) AS start, endNode(r) AS end, r
-        
-        // 5. 返回结构化的拓扑数据
-        RETURN target.Tag as tag, 
-               'Fault_Diagnosis' as intent, 
+        MATCH (e:Asset) WHERE e.Tag = qTag OR replace(e.Tag, '-', '') = replace(qTag, '-', '')
+        OPTIONAL MATCH (i:Instrument)-[:MEASURES]->(e)
+        RETURN 'Status_Check' as intent, e.Tag as tag, properties(e) as params,
+               collect({tag: i.Tag, desc: i.desc, unit: i.unit, range: i.range}) as sensors
+        """
+        params = {"tags": tags}
+
+    elif intent == "Fault_Diagnosis":
+        # ... (保持之前优化的溯源代码) ...
+        cypher = """
+        UNWIND $tags AS qTag
+        MATCH (target:Asset) WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
+        MATCH path = (target)<-[:PIPE|LINKS_TO*1..6]-(source:Asset)
+        WHERE NOT source:OffPageConnector AND source.Tag <> 'TEE'
+        WITH target, source, relationships(path)[0] as r
+        RETURN 'Fault_Diagnosis' as intent, target.Tag as tag,
                collect(DISTINCT {
-                   // 连线起点 (上游)
-                   source: start.Tag,
-                   source_type: start.type,
-                   source_desc: start.desc,
-                   
-                   // 连线终点 (下游)
-                   target: end.Tag,
-                   target_type: end.type,
-                   
-                   // === 核心物理语义 (AI 诊断的关键) ===
-                   fluid: r.fluid,           // 介质 (如: Steam, Water)
-                   from_region: r.fromRegion,// 起点区域 (如: ShellSide)
-                   to_region: r.toRegion,    // 终点区域 (如: TubeSide) -> 诊断串料/干烧的关键
-                   insulation: r.insulation  // 保温/伴热 -> 诊断冻结/结晶的关键
+                   source: source.Tag, 
+                   s_desc: source.desc, 
+                   fluid: r.fluid,
+                   pipe_desc: r.desc  // <--- 新增：抓取管线描述
                }) as upstream_trace
         """
         params = {"tags": tags}
 
-    elif intent == "Status_Check":
-        # 仪表检查：侧重于 MEASURES 关系和 Instrument 节点的参数
+    elif intent == "Procedure_Query":
+        # 【新增】规程查询：图数据库仅用于确认位号描述，主要靠向量库
         cypher = """
         UNWIND $tags AS qTag
-        MATCH (target:Asset) WHERE target.Tag = qTag OR replace(target.Tag, '-', '') = replace(qTag, '-', '')
-        OPTIONAL MATCH (target)-[:MEASURES]-(sensor:Instrument)
-        RETURN target.Tag as tag, target.desc as desc, 
-               {temp: target.design_temp, press: target.design_press, spec: target.spec} as design_params,
-               collect(DISTINCT {tag: sensor.Tag, desc: sensor.desc, range: sensor.range, unit: sensor.unit}) as sensors
+        MATCH (e:Asset) WHERE e.Tag = qTag OR replace(e.Tag, '-', '') = replace(qTag, '-', '')
+        RETURN 'Procedure_Query' as intent, e.Tag as tag, e.desc as desc
         """
         params = {"tags": tags}
 
-    else:
-        # 基础查询：返回位号、描述和类型
+    else: # Info_Query
+        # ... (保持基础查询代码) ...
         cypher = """
-         UNWIND $tags AS qTag
-        
-        // 1. 模糊匹配找到中心设备
-        MATCH (center:Asset) 
-        WHERE center.Tag = qTag OR replace(center.Tag, '-', '') = replace(qTag, '-', '')
-        
-        // 2. 双向扩展：查找距离中心设备 1 到 3 跳的所有路径
-        // 注意这里没有箭头，表示双向查找 (Upstream & Downstream)
-        // 包含 PIPE (管线), CONTROLS (控制), MEASURES (测量)
-        MATCH path = (center)-[:PIPE|CONTROLS|MEASURES*1..3]-(neighbor:Asset)
-        
-        // 3. 展开路径中的每一段关系
-        UNWIND relationships(path) AS r
-        
-        // 4. 提取物理流向 (无论查询方向如何，startNode->endNode 永远代表物理流向)
-        WITH center, startNode(r) AS source, endNode(r) AS target, r, type(r) as relType
-        
-        // 5. 过滤掉无意义的纯连接节点 (如 TEE)，除非它是路径的中间环节
-        // (这里选择保留 TEE 的连接关系，但在展示时由前端或 LLM 决定是否忽略)
-        
-        // 6. 返回去重后的拓扑结构
-        RETURN center.Tag as tag, 
-               'Info_Query' as intent,
-               // 汇总该设备周围的所有属性
-               {
-                   type: center.type,
-                   desc: center.desc,
-                   spec: center.spec,
-                   material: center.material
-               } as self_info,
+        UNWIND $tags AS qTag
+        MATCH (e:Asset) WHERE e.Tag = qTag OR replace(e.Tag, '-', '') = replace(qTag, '-', '')
+        OPTIONAL MATCH (e)-[r:PIPE|CONTROLS|MEASURES]-(neighbor:Asset)
+        RETURN 'Info_Query' as intent, e.Tag as tag, e.desc as desc, e.type as type,
                collect(DISTINCT {
-                   // 关系类型 (PIPE/CONTROLS/MEASURES)
-                   type: relType,
-                   
-                   // 起点 (流出方)
-                   source: source.Tag,
-                   source_type: source.type,
-                   
-                   // 终点 (流入方)
-                   target: target.Tag,
-                   target_type: target.type,
-                   
-                   // 物理语义细节
-                   fluid: r.fluid,
-                   from_region: r.fromRegion, // 关键：从哪个腔室出来
-                   to_region: r.toRegion,     // 关键：进哪个腔室
-                   tag: r.tag                 // 管段号
+                   type: type(r), 
+                   neighbor: neighbor.Tag, 
+                   n_desc: neighbor.desc,
+                   fluid: r.fluid, 
+                   rel_desc: r.desc,   // <--- 新增：抓取关系描述
+                   from_reg: r.fromRegion, 
+                   to_reg: r.toRegion
                }) as topology
         """
         params = {"tags": tags}
@@ -375,107 +294,90 @@ def translate_region(region_code):
     return mapping.get(region_code, region_code)
 
 def format_graph_data(data, intent):
-    """
-    将 Neo4j 返回的 JSON 列表转换为 LLM 友好的链式叙述文本
-    增强版：明确标注了来源端口(fromRegion)和到达端口(toRegion)
-    """
-    if not data:
-        return "未查询到相关图谱数据。"
-    
+    """语义无损的路径压缩与属性聚合算法"""
+    if not data: return "未查询到相关图谱事实。"
     text_lines = []
-    
-    # === 场景 1: 路径分析 (Path_Analysis) ===
-    if intent == "Path_Analysis":
-        for path_idx, record in enumerate(data):
-            text_lines.append(f"🛣️ **物理路径 #{path_idx + 1} (总跳数: {record.get('total_hops', 0)})**:")
-            steps = record.get('structured_process_flow', [])
-            
-            for i, step in enumerate(steps):
-                # 1. 提取起点及来源端口
-                src = step['from_equipment']
-                pipe = step['pipeline_semantics']
-                
-                src_tag = src['tag'] if isinstance(src, dict) else src
-                src_desc = f"({src['desc']})" if isinstance(src, dict) and src.get('desc') else ""
-                from_reg = translate_region(pipe.get('fromRegion')) # 新增：来源端口
-                
-                # 格式化起点：🏭 设备 (描述) [出口: 壳程]
-                src_str = f"🏭 **{src_tag}**{src_desc}"
-                if from_reg != "通用接口":
-                    src_str += f" `[出口: {from_reg}]`"
-                
-                # 2. 管道/关系语义
-                fluid = pipe.get('fluid', '未知介质')
-                p_tag = pipe.get('tag') or '无管号'
-                insulation = pipe.get('insulation', 'None')
-                conn_desc = f" ==( 🌊{fluid} | 🏷️{p_tag}"
-                if insulation != 'None': conn_desc += f" | 🔥{insulation}"
-                conn_desc += " )==> "
-                
-                # 3. 提取终点及进入端口
-                tgt = step['to_equipment']
-                tgt_tag = tgt['tag'] if isinstance(tgt, dict) else tgt
-                tgt_desc = f"({tgt['desc']})" if isinstance(tgt, dict) and tgt.get('desc') else ""
-                to_reg = translate_region(pipe.get('toRegion')) # 保持：进入端口
-                
-                # 格式化终点：[入口: 管程] 🏭 设备 (描述)
-                tgt_str = f"**{tgt_tag}**{tgt_desc}"
-                if to_reg != "通用接口":
-                    tgt_str = f"`[入口: {to_reg}]` 🏭 {tgt_str}"
-                else:
-                    tgt_str = f"🏭 {tgt_str}"
-                
-                text_lines.append(f"   {i+1}. {src_str}{conn_desc}{tgt_str}")
-            text_lines.append("") 
 
-    # === 场景 2: 故障诊断 (Fault_Diagnosis) ===
+    # --- 场景 A: 状态检查 ---
+    if intent == "Status_Check":
+        for record in data:
+            text_lines.append(f"📋 **设备参数档案**: {record['tag']}")
+            params = record.get('params', {})
+            for k, v in params.items():
+                if k not in ['Tag', 'desc', 'id'] and v and v != "None":
+                    text_lines.append(f"   - {k}: {v}")
+            sensors = record.get('sensors', [])
+            if sensors:
+                text_lines.append(f"   **关联监控仪表**:")
+                for s in sensors:
+                    text_lines.append(f"   - 🏷️ {s['tag']} ({s['desc']}) | 量程: {s.get('range','--')} {s.get('unit','')}")
+            text_lines.append("")
+
+    # --- 场景 B: 路径分析 (核心聚合逻辑) ---
+    elif intent == "Path_Analysis":
+        for record in data:
+            nodes = record.get('nodes_data', [])
+            rels = record.get('rels_data', [])
+            if not nodes: continue
+            
+            text_lines.append(f"🛣️ **全链路工艺追踪 (跨度: {record.get('total_hops', 0)} 步)**:")
+            current_equip = nodes[0]
+            attr_accumulator = {} 
+
+            for i in range(len(rels)):
+                rel = rels[i]
+                next_node = nodes[i+1]
+                # 累积管线属性
+                for k, v in rel.items():
+                    if v and v != "None": attr_accumulator[k] = v
+                
+                # 遇到真实设备才输出
+                if not is_noise_node(next_node.get('labels', []), next_node.get('tag', '')):
+                    src_str = f"**{current_equip['tag']}** ({current_equip.get('desc','设备')})"
+                    tgt_str = f"**{next_node['tag']}** ({next_node.get('desc','设备')})"
+                    
+                    fluid = attr_accumulator.get('fluid', '未知介质')
+                    dn = f"{attr_accumulator['dn']}" if attr_accumulator.get('dn') else ""
+                    mat = attr_accumulator.get('material', '')
+                    p_desc = attr_accumulator.get('desc', '') # 获取管线描述
+                    
+                    from_reg = translate_region(rels[i - (i if i==0 else 0)].get('fromRegion'))
+                    to_reg = translate_region(rel.get('toRegion'))
+
+                    # 【修正点】：将 p_desc 放入 join 列表中
+                    pipe_detail = " | ".join(filter(None, [fluid, dn, mat, p_desc])) 
+                    line = f"   📍 {src_str} `[{from_reg}]` ==( 🌊 {pipe_detail} )==> `[{to_reg}]` {tgt_str}"
+                    text_lines.append(line)
+                    
+                    current_equip = next_node
+                    attr_accumulator = {}
+            text_lines.append("*(注：已自动合并跨页连接符及三通节点的物理属性)*\n")
+
+    # --- 场景 C: 故障诊断 ---
     elif intent == "Fault_Diagnosis":
         for record in data:
-            target_tag = record.get('tag')
-            text_lines.append(f"🛠️ **目标设备**: {target_tag}")
-            text_lines.append("   **上游溯源 (Upstream Trace):**")
-            
-            traces = record.get('upstream_trace', [])
-            for trace in traces:
-                source_tag = trace.get('source')
-                from_reg = translate_region(trace.get('from_region')) # 新增：来源端口
-                to_reg = translate_region(trace.get('to_region'))     # 保持：进入端口
-                fluid = trace.get('fluid', 'Unknown')
-                
-                # 增强版诊断语义：[来源设备][出口接口] --(介质)--> [目标设备][入口接口]
-                line = f"   ⬆️ 来源: **{source_tag}** `[{from_reg}]` "
-                line += f" --输送: {fluid}--> "
-                line += f"进入目标设备的 **[{to_reg}]**"
-                text_lines.append(line)
-            text_lines.append("")
+            text_lines.append(f"🛠️ **故障溯源目标**: {record['tag']}")
+            for trace in record.get('upstream_trace', []):
+                # 【修正点】：增加管线描述展示
+                p_desc = f"[{trace['pipe_desc']}]" if trace.get('pipe_desc') else ""
+                text_lines.append(f"   ⬆️ 来源: **{trace['source']}**({trace.get('s_desc','设备')}) --({trace.get('fluid','介质')}{p_desc})--> 进入目标")
 
-    # === 场景 3: 信息查询 (Info_Query) ===
-    elif intent == "Info_Query":
+    # --- 场景 D: 规程查询 ---
+    elif intent == "Procedure_Query":
         for record in data:
-            self_info = record.get('self_info', {})
-            text_lines.append(f"ℹ️ **设备档案**: {record.get('tag')}")
-            text_lines.append(f"   **详细拓扑 (Topology Detail):**")
-            
-            topo = record.get('topology', [])
-            for t in topo:
-                # 识别当前设备是起点还是终点
-                is_source = (t.get('source') == record.get('tag'))
-                neighbor = t.get('target') if is_source else t.get('source')
-                direction = "➡️ 流出至" if is_source else "⬅️ 接收来自"
-                
-                # 关键：同时展示本端接口和对端接口
-                local_reg = translate_region(t.get('from_region') if is_source else t.get('to_region'))
-                fluid = t.get('fluid', 'N/A')
-                
-                line = f"   - {direction} **{neighbor}** (介质: {fluid} | 本端接口: {local_reg})"
-                text_lines.append(line)
-            text_lines.append("")
+            text_lines.append(f"📖 **正在检索关于 {record['tag']}({record['desc']}) 的操作规程...**")
 
+    # --- 场景 E: 基础查询 ---
     else:
-        text_lines.append(json.dumps(data, ensure_ascii=False, indent=2))
+        for record in data:
+            text_lines.append(f"ℹ️ **设备档案**: {record.get('tag')} ({record.get('desc', '无描述')})")
+            # 【修正点】：基础查询也应该展示周围的拓扑关系
+            for t in record.get('topology', []):
+                p_desc = f"[{t['rel_desc']}]" if t.get('rel_desc') else ""
+                reg = translate_region(t.get('from_reg') or t.get('to_reg'))
+                text_lines.append(f"   - 关联: **{t['neighbor']}**({t.get('n_desc','设备')}) | {t['fluid']} {p_desc} | 接口: {reg}")
 
     return "\n".join(text_lines)
-
 # ==============================================================================
 # 👆👆👆 插入结束 👆👆👆
 # ============================================================================
@@ -568,26 +470,23 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
         
         with st.status("🔍 正在检索双库事实...", expanded=True) as status:
             extracted_tags = extract_tags(prompt)
-            st.write(f"🏷️ **识别位号**: `{', '.join(extracted_tags) if extracted_tags else '未识别'}`")
-            
+            # 【修正点 1】：先识别意图
             intent_res = analyze_intent_with_llm(prompt, extracted_tags)
-            st.write(f"🎯 **解析意图**: `{intent_res.get('intent', 'Info_Query')}`")
+            current_intent = intent_res.get('intent', 'Info_Query') # 获取真实意图
+            st.write(f"🏷️ **识别位号**: `{', '.join(extracted_tags)}` | 🎯 **意图**: `{current_intent}`")
+            
+            # 【修正点 2】：根据真实意图决定检索文档数
+            n_docs = 6 if current_intent == "Procedure_Query" else 3
             
             cypher, params = build_cypher(intent_res, extracted_tags, prompt)
             if cypher:
                 graph_data = query_neo4j(cypher, params)
-                # --- 这里的逻辑改为条件显示 ---
-                if graph_data:
-                        st.write("✅ **图谱事实**: 已成功检索到关联拓扑")
-                else:
-                     st.write("⚠️ **图谱事实**: 未能在图数据库中找到匹配的路径或节点")
             
             q_emb = ollama.embeddings(model=EMBED_MODEL, prompt=prompt)['embedding']
-            vector_res = collection.query(query_embeddings=[q_emb], n_results=3)
+            vector_res = collection.query(query_embeddings=[q_emb], n_results=n_docs)
             vector_docs = vector_res['documents'][0]
-            st.write(f"📄 **文档知识**: 已匹配相关描述片段")
             
-            status.update(label=f"✅ 检索完成: 命中 {len(graph_data)} 条事实, {len(vector_docs)} 段文档", state="complete", expanded=False)
+            status.update(label=f"✅ 检索完成: {current_intent}", state="complete", expanded=False)
 
         # 2. 回答生成阶段
         full_response = ""
@@ -688,18 +587,49 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
             # === [修改结束] ===
             
             # --- 提示词微调 (确保模型不会太啰嗦) ---
-            sys_prompt = f"""你是一个专业的化工装置专家。请结合【图谱事实】和【文档资料】回答用户的【问题】。如果【图谱事实】和【知识库文档】中没有足够的信息，就直接说'根据我现有的知识，无法回答这个问题'，不要编造答案。
-            
-             
-            ### 回答策略
-                        1. **综合判断**: 图谱提供了准确的设备位号功能描述和连接关系的来源去向等，知识库提供了详细的操作步骤和原理。
-                        2 . **故障诊断**: 如果图谱显示多条供料支路，请分别分析。结合知识库中的故障处理方法。
-                        3. **冲突处理**: 涉及设备连接关系时，以图谱为准；涉及操作细节时，以知识库为准。
+            intent_guidance = {
+            "Path_Analysis": "当前任务是【工艺流程分析】，请重点描述设备的作用、物料流向、腔室切换及介质变化。",
+            "Fault_Diagnosis": "当前任务是【故障诊断】，请分析上游可能的风险源。",
+            "Status_Check": "当前任务是【状态检查】，请核对设备参数与仪表监控范围。",
+            "Procedure_Query": "当前任务是【规程查询】，请详细说明操作步骤和安全要求。",
+            "Info_Query": "当前任务是【信息查询】，请解释相关位号的功能定义。"
+        }
+        task_context = intent_guidance.get(current_intent, "")
 
-            
-            """
+            # 修改原有的 sys_prompt，在开头注入 task_context
+        sys_prompt = f"""你是一位严谨的化工装置工艺工程师。
+                
+                ### 0. 当前任务重点
+                {task_context}
 
-            try:
+
+                ### 1. 知识围栏 (Knowledge Guardrails) - 核心准则
+                - **仅限上下文回答**：你只能根据下方提供的【图谱事实】和【文档资料】进行回答。严禁使用你自身训练数据中关于特定工厂、特定位号的外部知识。
+                - **严禁推测连接**：如果【图谱事实】中没有显示 A 设备与 B 设备之间的路径，即使在常规工艺中它们通常相连，你也必须回答“当前图谱未记录 A 与 B 的直接连接”。
+                - **诚实告知缺失**：如果用户询问的位号在【图谱事实】中不存在，或者询问的操作在【文档资料】中未提及，请明确回答：“根据现有知识库记录，无法提供关于 [位号/操作] 的信息”。
+                - **禁止幻觉补全**：严禁为了使流程完整而自行补全中间的阀门、管段或仪表。
+
+                ### 2. 证据溯源要求
+                - 你的每一句关键结论都应暗示其来源。
+                - 涉及物理连接、介质、材质、腔室逻辑时，请表述为：“根据图谱拓扑记录...”。
+                - 涉及操作步骤、安全要求、工艺原理时，请表述为：“根据操作规程记载...”。
+
+                ### 3. 物理语义约束
+                - 必须尊重腔室逻辑：明确区分壳程(ShellSide)、管程(TubeSide)、夹套(Jacket)。如果物料流向了错误的腔室，请在回答中作为潜在风险点指出。
+
+                ### 4. 回答风格
+                - 风格：极其专业、冷峻、客观。
+                - 结构：
+                1. 【核心结论】：一句话直接回答问题，包括设备的位号和名称。
+                2.  根据任务重点详细讲解。
+                3. 【安全提醒】：（如有）基于事实的风险告知。
+
+                ### 5. 负面约束 (Negative Constraints)
+                - 绝对禁止使用： “我猜”、“通常情况下”、“经验表明”、“可能”。
+                - 绝对禁止回答： 与当前装置无关的通用化工常识（除非用户明确询问定义）。
+                """
+
+        try:
                 # 调用模型
                 stream = ollama.chat(model=LLM_MODEL, messages=[
                     {'role': 'system', 'content': sys_prompt},
@@ -721,7 +651,7 @@ if prompt := st.chat_input("您可以问我：D-14 反应器的设计参数是�
                 # 完成输出，移除光标
                 response_placeholder.markdown(full_response)
                 
-            except Exception as e:
+        except Exception as e:
                 thinking_container.empty()
                 st.error(f"❌ 模型生成失败: {e}")
 
